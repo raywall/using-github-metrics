@@ -73,6 +73,8 @@ func main() {
 	showMessage(fmt.Sprintf("- Tamanho branch '%s': %d KB | Duração média workflow '%s': %.2f s", Branch, branchSize/1024, WorkflowName, formattedAvgDuration))
 	showMessage(fmt.Sprintf("- Merges com conflitos resolvidos: %d", conflictCount))
 	showMessage(fmt.Sprintf("- Issues de rollback: %d", rollbackCount))
+
+	dumpOutputFile()
 }
 
 // Calculates the total size of files (blobs) in the specific branch (in bytes)
