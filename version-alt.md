@@ -139,3 +139,42 @@ func getAverageRunAttempts(ctx context.Context, client *github.Client, since tim
 	avg := float64(totalAttempts) / float64(count)
 	return avg, count
 }
+func countMergeConflicts(ctx context.Context, client *github.Client, since time.Time) int {
+	count := 0
+	opts := &github.PullRequestListOptions{
+		State:     "closed", // ou "all" se quiser incluir open
+		Sort:      "updated",
+		Direction: "desc",
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+
+	for {
+		prs, resp, err := client.PullRequests.List(ctx, Owner, RepoName, opts)
+		if err != nil {
+			// ...
+		}
+
+		for _, pr := range prs {
+			if pr.ClosedAt == nil || pr.ClosedAt.Before(since) {
+				continue
+			}
+
+			// Pegue detalhes completos do PR (mergeable_state)
+			fullPR, _, err := client.PullRequests.Get(ctx, Owner, RepoName, *pr.Number)
+			if err != nil {
+				continue
+			}
+
+			if fullPR.Mergeable != nil && !*fullPR.Mergeable &&
+				fullPR.MergeableState != nil && *fullPR.MergeableState == "dirty" {
+				count++
+			}
+		}
+
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return count
+}
