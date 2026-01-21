@@ -2,291 +2,350 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v62/github"
 	"golang.org/x/oauth2"
 )
 
-const (
-	// setup
-	Owner        = "raywall"                  // ex: "my-org-or-username"
-	RepoName     = "fast-service-toolkit"     // ex: "my-repository-name"
-	WorkflowName = "2 - [DEV] Build & Deploy" // exact name of the workflow to be analyzed (do .yml ou display name)
-	Branch       = "main"                     // exact branch name that will be used to check size
-	MonthsBack   = 1                          // how many months you want to validate
-)
-
 var (
-	token = os.Getenv("GITHUB_TOKEN") // personal Access Token with scopes: repo, workflow
-	traces = make([]string, 0)
+	token = os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		log.Fatal("GITHUB_TOKEN não definido")
+	}
+
+	// global settings
+	Owner       = "raywall" // your org or username
+	Branch      = "main"
+	WorkflowName = "2 - [DEV] Build & Deploy"
+	MonthsBack  = 1 // adjust as needed
+
+	// repositories by area
+	ReposByArea = map[string][]string{
+		"Backend": {
+			"fast-service-toolkit",
+			"payment-service",
+			"auth-service",
+		},
+		"Frontend": {
+			"web-app",
+			"admin-panel",
+		},
+		"Infrastructure": {
+			"terraform-modules",
+			"monitoring-stack",
+		},
+		// add more areas/repos as needed
+	}
+
+	// limit on simultaneous goroutines (avoids GitHub's rate limit)
+	maxConcurrency = 5
 )
 
-func init() {
-	jsonHandler := slog.NewJSONHandler(os.Stdout, nil)
-	slog.SetDefault(slog.New(jsonHandler))
+type RepoResult struct {
+	Area          string
+	Repo          string
+	BranchSizeMB  float64
+	PeriodFrom    string
+	PeriodTo      string
+	AvgAttempts   float64
+	TotalRuns     int
+	TotalAttempts int // sum of all attempts
+	Conflicts     int
+	Rollbacks     int
+	Err           error
 }
 
 func main() {
 	ctx := context.Background()
-
-	// authentication
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
 	tc := oauth2.NewClient(ctx, ts)
 	client := github.NewClient(tc)
 
-	// check the branch size
-	branchSize, err := getBranchSize(ctx, client)
-	if err != nil {
-		showMessage(fmt.Sprintf("Erro ao calcular tamanho da branch: %v", err))
-		os.Exit(1)
-	}
+	logChan := make(chan string, 100)
+	wgLog := sync.WaitGroup{}
+	wgLog.Add(1)
+	go func() {
+		defer wgLog.Done()
+		f, err := os.OpenFile("github-analysis.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Printf("erro ao criar log file: %v", err)
+			return
+		}
+		defer f.Close()
 
-	showMessage(fmt.Sprintf("Repositório: %s/%s", Owner, RepoName))
-	showMessage(fmt.Sprintf("Tamanho da branch '%s': %d KB", Branch, branchSize/1024)) // convert bytes to KB
+		for msg := range logChan {
+			fmt.Fprintln(f, msg)
+			fmt.Println(msg) // also on the console
+		}
+	}()
 
-	from := time.Now().AddDate(0, -(MonthsBack + 1), 0)
-	to := time.Now().AddDate(0, -1, 0)
-	showMessage(fmt.Sprintf("Período analisado: %s a %s\n", oneMonthAgo.Format("2006-01-02"), now.Format("2006-01-02")))
+	results := make([]RepoResult, 0)
+	resultsMu := sync.Mutex{}
+	sem := make(chan struct{}, maxConcurrency)
+	wg := sync.WaitGroup{}
 
-	// 1. average duration of the specified workflow
-	showMessage("Analisando workflow durations...")
-	_, avgDuration := getWorkflowDurations(ctx, client, oneMonthAgo)
-	formattedAvgDuration = timeFormat(int(avgDuration))
-	showMessage(fmt.Sprintf("Duração média de runs bem-sucedidos do workflow '%s': %.2f segundos\n", WorkflowName, formattedAvgDuration))
+	from := time.Now().AddDate(0, -(MonthsBack+1), 0).Truncate(24 * time.Hour)
+	to := time.Now().AddDate(0, -1, 0).Truncate(24 * time.Hour)
 
-	// 2. merge conflicts (PRs with conflict resolution commits in the period)
-	showMessage("Analisando conflitos de merge...")
-	conflictCount := countMergeConflicts(ctx, client, oneMonthAgo)
-	showMessage(fmt.Sprintf("Quantidade de merges com conflitos resolvidos no período: %d\n", conflictCount))
+	logChan <- fmt.Sprintf("Período global: %s a %s", from.Format("02-01-2006"), to.Format("02-01-2006"))
 
-	// 3. rollback issues (closed with label containing 'rollback')
-	showMessage("Analisando issues de rollback...")
-	rollbackCount := countRollbackIssues(ctx, client, oneMonthAgo)
-	showMessage(fmt.Sprintf("Quantidade de issues de rollback: %d\n", rollbackCount))
+	for area, repos := range ReposByArea {
+		for _, repo := range repos {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(area, repo string) {
+				defer wg.Done()
+				defer func() { <-sem }()
 
-	// summary
-	showMessage("Resumo:")
-	showMessage(fmt.Sprintf("- Tamanho branch '%s': %d KB | Duração média workflow '%s': %.2f s", Branch, branchSize/1024, WorkflowName, formattedAvgDuration))
-	showMessage(fmt.Sprintf("- Merges com conflitos resolvidos: %d", conflictCount))
-	showMessage(fmt.Sprintf("- Issues de rollback: %d", rollbackCount))
+				logChan <- fmt.Sprintf("Processando %s/%s...", area, repo)
 
-	dumpOutputFile()
-}
+				res := processRepo(ctx, client, area, repo, from, to)
+				resultsMu.Lock()
+				results = append(results, res)
+				resultsMu.Unlock()
 
-// Calculates the total size of files (blobs) in the specific branch (in bytes)
-func getBranchSize(ctx context.Context, client *github.Client) (int64, error) {
-	ref, _, err := client.Git.GetRef(ctx, Owner, RepoName, "heads/"+Branch)
-	if err != nil {
-		return 0, fmt.Errorf("erro ao obter ref da branch: %w", err)
-	}
-
-	tree, _, err := client.Git.GetTree(ctx, Owner, RepoName, *ref.Object.SHA, true) // recursive=true
-	if err != nil {
-		return 0, fmt.Errorf("erro ao obter tree recursivo: %w", err)
-	}
-
-	var totalSize int64
-	for _, entry := range tree.Entries {
-		if *entry.Type == "blob" && entry.Size != nil {
-			totalSize += int64(*entry.Size)
+				if res.Err != nil {
+					logChan <- fmt.Sprintf("Erro em %s/%s: %v", area, repo, res.Err)
+				}
+			}(area, repo)
 		}
 	}
-	return totalSize, nil
+
+	wg.Wait()
+	close(logChan)
+	wgLog.Wait()
+
+	generateMarkdown(results, from, to)
+	log.Println("Análise concluída. Arquivo gerado: output.md")
 }
 
-func getWorkflowDurations(ctx context.Context, client *github.Client, since time.Time) ([]int64, float64) {
-	// first, find the workflow ID by name
-	workflows, _, err := client.Actions.ListWorkflows(ctx, Owner, RepoName, &github.ListOptions{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Erro ao listar workflows: %v", err)
-		return nil, 0
+func processRepo(ctx context.Context, client *github.Client, area, repo string, from, to time.Time) RepoResult {
+	res := RepoResult{
+		Area:       area,
+		Repo:       repo,
+		PeriodFrom: from.Format("02-01-2006"),
+		PeriodTo:   to.Format("02-01-2006"),
 	}
 
-	var workflowID int64
+	// branch size
+	sizeBytes, err := getBranchSize(ctx, client, repo)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	res.BranchSizeMB = float64(sizeBytes) / (1024 * 1024)
+
+	// workflow ID (simple cache per repo)
+	workflowID, err := getWorkflowID(ctx, client, repo)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+
+	// media and total attempts
+	avgAtt, totalRuns, totalAtt, err := getAverageAndTotalRunAttempts(ctx, client, repo, workflowID, from)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	res.AvgAttempts = avgAtt
+	res.TotalRuns = totalRuns
+	res.TotalAttempts = totalAtt
+
+	// conflicts (using mergeable_state == "dirty")
+	res.Conflicts, err = countMergeConflicts(ctx, client, repo, from)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+
+	// rollback issues
+	res.Rollbacks, err = countRollbackIssues(ctx, client, repo, from)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+
+	return res
+}
+
+func getBranchSize(ctx context.Context, client *github.Client, repo string) (int64, error) {
+	ref, _, err := client.Git.GetRef(ctx, Owner, repo, "heads/"+Branch)
+	if err != nil {
+		return 0, err
+	}
+	tree, _, err := client.Git.GetTree(ctx, Owner, repo, *ref.Object.SHA, true)
+	if err != nil {
+		return 0, err
+	}
+	var size int64
+	for _, e := range tree.Entries {
+		if *e.Type == "blob" && e.Size != nil {
+			size += int64(*e.Size)
+		}
+	}
+	return size, nil
+}
+
+func getWorkflowID(ctx context.Context, client *github.Client, repo string) (int64, error) {
+	workflows, _, err := client.Actions.ListWorkflows(ctx, Owner, repo, &github.ListOptions{PerPage: 100})
+	if err != nil {
+		return 0, err
+	}
 	for _, wf := range workflows.Workflows {
 		if wf.Name != nil && *wf.Name == WorkflowName {
-			workflowID = *wf.ID
-			break
+			return *wf.ID, nil
 		}
 	}
-	if workflowID == 0 {
-		fmt.Fprintf(os.Stderr, "Workflow '%s' não encontrado", WorkflowName)
-		return nil, 0
-	}
+	return 0, fmt.Errorf("workflow %q não encontrado em %s", WorkflowName, repo)
+}
 
-	var totalDuration int64
-	var count int
-
+func getAverageAndTotalRunAttempts(ctx context.Context, client *github.Client, repo string, workflowID int64, since time.Time) (avg float64, totalRuns, totalAttempts int) {
 	opts := &github.ListOptions{PerPage: 100}
 	for {
-		runs, resp, err := client.Actions.ListWorkflowRunsByID(
-			ctx,
-			Owner,
-			RepoName,
-			workflowID,
+		runs, resp, err := client.Actions.ListWorkflowRunsByID(ctx, Owner, repo, workflowID,
 			&github.ListWorkflowRunsOptions{
 				Status:      "completed",
 				Created:     ">" + since.Format("2006-01-02"),
 				ListOptions: *opts,
-			},
-		)
+			})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erro ao listar runs do workflow: %v", err)
-			break
+			return 0, 0, 0
 		}
-
-		for _, run := range runs.WorkflowRuns {
-			if run.Conclusion != nil && *run.Conclusion == "success" &&
-				run.CreatedAt != nil && run.UpdatedAt != nil {
-				duration := run.UpdatedAt.Sub(run.CreatedAt.Time).Seconds()
-				if duration > 0 {
-					totalDuration += int64(duration)
-					count++
+		for _, r := range runs.WorkflowRuns {
+			if r.Conclusion != nil && *r.Conclusion == "success" {
+				attempt := 1
+				if r.RunAttempt != nil {
+					attempt = *r.RunAttempt
 				}
+				totalAttempts += attempt
+				totalRuns++
 			}
 		}
-
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-
-	if count == 0 {
-		return nil, 0
+	if totalRuns == 0 {
+		return 0, 0, 0
 	}
-	avg := float64(totalDuration) / float64(count)
-	return []int64{}, avg // it's possible collect the individual durations if you want
+	return float64(totalAttempts) / float64(totalRuns), totalRuns, totalAttempts
 }
 
-func countMergeConflicts(ctx context.Context, client *github.Client, since time.Time) int {
+func countMergeConflicts(ctx context.Context, client *github.Client, repo string, since time.Time) (int, error) {
 	count := 0
 	opts := &github.PullRequestListOptions{
 		State:       "closed",
 		Sort:        "updated",
 		Direction:   "desc",
-		ListOptions: github.ListOptions{PerPage: 100},
+		ListOptions: github.ListOptions{PerPage: 50}, // smaller for performance
 	}
-
 	for {
-		prs, resp, err := client.PullRequests.List(ctx, Owner, RepoName, opts)
+		prs, resp, err := client.PullRequests.List(ctx, Owner, repo, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erro ao listar PRs: %v", err)
-			break
+			return 0, err
 		}
-
 		for _, pr := range prs {
-			if pr.ClosedAt == nil || pr.ClosedAt.Before(since) {
-				continue // ignore PRs closed before the period
-			}
-
-			commitOpts := &github.ListOptions{PerPage: 100}
-			var hasConflictInPeriod bool
-			for {
-				commits, cResp, err := client.PullRequests.ListCommits(ctx, Owner, RepoName, *pr.Number, commitOpts)
-				if err != nil {
-					break
+			if pr.ClosedAt != nil && !pr.ClosedAt.Before(since) {
+				full, _, err := client.PullRequests.Get(ctx, Owner, repo, *pr.Number)
+				if err == nil && full.Mergeable != nil && !*full.Mergeable &&
+					full.MergeableState != nil && *full.MergeableState == "dirty" {
+					count++
 				}
-
-				for _, c := range commits {
-					if c.Commit != nil && c.Commit.Author != nil && c.Commit.Author.Date != nil &&
-						c.Commit.Author.Date.After(since) { // Commit criado no período
-						msg := strings.ToLower(*c.Commit.Message)
-						if strings.Contains(msg, "conflict") || strings.Contains(msg, "resolve conflict") ||
-							strings.Contains(msg, "merge conflict") {
-							hasConflictInPeriod = true
-							break
-						}
-					}
-				}
-
-				if hasConflictInPeriod {
-					break
-				}
-
-				if cResp.NextPage == 0 {
-					break
-				}
-				commitOpts.Page = cResp.NextPage
-			}
-
-			if hasConflictInPeriod {
-				count++
 			}
 		}
-
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-
-	return count
+	return count, nil
 }
 
-func countRollbackIssues(ctx context.Context, client *github.Client, since time.Time) int {
+func countRollbackIssues(ctx context.Context, client *github.Client, repo string, since time.Time) (int, error) {
 	count := 0
 	opts := &github.IssueListByRepoOptions{
 		State:       "closed",
 		Since:       since,
-		ListOptions: github.ListOptions{PerPage: 100},
+		ListOptions: github.ListOptions{PerPage: 50},
 	}
-
 	for {
-		issues, resp, err := client.Issues.ListByRepo(ctx, Owner, RepoName, opts)
+		issues, resp, err := client.Issues.ListByRepo(ctx, Owner, repo, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erro ao listar issues: %v", err)
-			break
+			return 0, err
 		}
-
 		for _, issue := range issues {
-			if issue.ClosedAt == nil || issue.ClosedAt.Before(since) {
-				continue
-			}
-
-			hasRollbackLabel := false
-			for _, label := range issue.Labels {
-				if label.Name != nil && strings.Contains(strings.ToLower(*label.Name), "rollback") {
-					hasRollbackLabel = true
-					break
+			if issue.ClosedAt != nil && !issue.ClosedAt.Before(since) {
+				for _, lbl := range issue.Labels {
+					if lbl.Name != nil && strings.Contains(strings.ToLower(*lbl.Name), "rollback") {
+						count++
+						break
+					}
 				}
 			}
-
-			if hasRollbackLabel {
-				count++
-			}
 		}
-
 		if resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage
 	}
-
-	return count
+	return count, nil
 }
 
-func showMessage(msg string) {
-	traces = append(traces, msg)
-	log.Println(msg)
-}
+func generateMarkdown(results []RepoResult, from, to time.Time) {
+	f, err := os.Create("output.md")
+	if err != nil {
+		log.Fatalf("erro ao criar output.md: %v", err)
+	}
+	defer f.Close()
 
-func timeFormat(totalSeconds int) string {
-	var (
-		hrs = totalSeconds / 3600
-		min = (totalSeconds % 3600) / 60
-		sec = totalSeconds / 60
-	)
+	// group by area and sort
+	areas := make([]string, 0, len(ReposByArea))
+	for a := range ReposByArea {
+		areas = append(areas, a)
+	}
+	sort.Strings(areas)
 
-	return fmt.Sprintf("%02d:%02d:%02d", hrs, min, sec)
-}
+	for _, area := range areas {
+		fmt.Fprintf(f, "### %s\n\n", area)
 
-func dumpOutputFile() {
-	if err := os.WriteFile("output.txx", []byte(strings.Join(trace, "")), 0644); err != nil {
-		log.Println("error generating a trace output file")
+		// filter area results
+		var areaResults []RepoResult
+		for _, r := range results {
+			if r.Area == area {
+				areaResults = append(areaResults, r)
+			}
+		}
+		// sort by repo name
+		sort.Slice(areaResults, func(i, j int) bool {
+			return areaResults[i].Repo < areaResults[j].Repo
+		})
+
+		for _, r := range areaResults {
+			if r.Err != nil {
+				fmt.Fprintf(f, "**Repositório**: %s — **ERRO**: %v\n\n", r.Repo, r.Err)
+				continue
+			}
+
+			repoLink := fmt.Sprintf("https://github.com/%s/%s", Owner, r.Repo)
+			reRuns := r.TotalAttempts - r.TotalRuns // effective amount of reruns
+
+			fmt.Fprintf(f, "**Repositório**: [%s](%s)\n", r.Repo, repoLink)
+			fmt.Fprintf(f, "**Tamanho da branch `%s`**: %.2f MB\n", Branch, r.BranchSizeMB)
+			fmt.Fprintf(f, "**Período avaliado**: %s a %s\n", r.PeriodFrom, r.PeriodTo)
+			fmt.Fprintf(f, "**Quantidade média de re-tentativas (re-runs) do workflow**: %.2f\n", r.AvgAttempts)
+			fmt.Fprintf(f, "**Quantidade total de re-tentativas (re-runs) do workflow**: %d\n", reRuns)
+			fmt.Fprintf(f, "**Quantidade de merges com conflitos resolvidos no período**: %d\n", r.Conflicts)
+			fmt.Fprintf(f, "**Quantidade de issues de rollback no período**: %d\n\n", r.Rollbacks)
+		}
 	}
 }
