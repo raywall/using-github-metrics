@@ -73,8 +73,8 @@ func getWorkflowDurations(ctx context.Context, client *github.Client, since time
 			Owner,
 			RepoName,
 			&github.ListWorkflowRunsOptions{
-				Status:      "completed",
-				Created:     ">" + since.Format("2006-01-02"),
+				Status:     "completed",
+				Created:    ">" + since.Format("2006-01-02"),
 				ListOptions: *opts,
 			},
 		)
