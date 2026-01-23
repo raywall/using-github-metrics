@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 var svc *analyzer.Analyzer
 
 func init() {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level:     slog.LevelDebug,
+		AddSource: true,
+	})
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
 	svc = analyzer.NewAnalyzer(
 		"raywall",
 		"main",
